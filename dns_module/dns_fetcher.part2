@@ -1,0 +1,394 @@
+                    elif rtype == 'soa' and rcode == 'NOERROR' and answers:
+                        soa_rcode, soa_answers, soa_ttl = rcode, answers, ttl
+                        core_ok['soa'] = True
+                    elif rtype == 'a' and rcode == 'NOERROR' and answers:
+                        a_rcode, a_answers, a_ttl = rcode, answers, ttl
+                        core_ok['a'] = True
+        
+        # If no core records succeeded after retries, mark as needs_retry
+        if not any(core_ok.values()):
+            record.status = 'needs_retry'
+            record.errors['core'] = 'All core lookups failed after retries'
+            return record
+        
+        # At least one core lookup succeeded - mark as alive
+        record.status = 'alive'
+        
+        # Store core results
+        if ns_answers:
+            record.records['NS'] = ns_answers
+            # Provide lowercase alias keys expected by downstream enrichers
+            try:
+                record.records['ns'] = [str(x).rstrip('.').lower() for x in ns_answers]
+            except Exception:
+                record.records['ns'] = ns_answers
+        else:
+            record.errors['NS'] = ns_rcode
+        
+        if soa_answers:
+            record.records['SOA'] = soa_answers
+        else:
+            record.errors['SOA'] = soa_rcode
+        
+        if a_answers:
+            record.records['A'] = a_answers
+            try:
+                record.records['a'] = [str(x) for x in a_answers]
+            except Exception:
+                record.records['a'] = a_answers
+        else:
+            record.errors['A'] = a_rcode
+        
+        # Phase 2: Check if any core record changed
+        change_tasks = [
+            dns_lookup.check_changed_and_enqueue_update('NS', domain, ns_rcode, ns_answers, ns_ttl),
+            dns_lookup.check_changed_and_enqueue_update('SOA', domain, soa_rcode, soa_answers, soa_ttl),
+            dns_lookup.check_changed_and_enqueue_update('A', domain, a_rcode, a_answers, a_ttl),
+        ]
+        
+        change_results = await asyncio.gather(*change_tasks, return_exceptions=True)
+        any_changed = any(r for r in change_results if not isinstance(r, BaseException) and r)
+
+        record.meta['changed'] = str(any_changed)
+        # Always fetch grouped records so outputs contain full DNS set
+        
+        # Phase 3: Fetch grouped records concurrently (AAAA, MX, TXT, CAA, NAPTR)
+        grouped_tasks = [
+            dns_lookup.lookup_aaaa(domain, resolver, semaphore),
+            dns_lookup.lookup_mx(domain, resolver, semaphore),
+            dns_lookup.lookup_txt(domain, resolver, semaphore),
+            dns_lookup.lookup_caa_struct(domain, resolver, semaphore),
+            dns_lookup.lookup_naptr_struct(domain, resolver, semaphore),
+        ]
+        
+        grouped_results = await asyncio.gather(*grouped_tasks, return_exceptions=True)
+        
+        # Process AAAA
+        if not isinstance(grouped_results[0], BaseException):
+            aaaa_rcode, aaaa_answers, aaaa_ttl = grouped_results[0]
+            if aaaa_rcode == 'NOERROR' and aaaa_answers:
+                record.records['AAAA'] = aaaa_answers
+            else:
+                record.errors['AAAA'] = aaaa_rcode
+            try:
+                record.meta['aaaa_ttl'] = int(aaaa_ttl) if aaaa_ttl is not None else None
+            except Exception:
+                pass
+        
+        # Process MX
+        if not isinstance(grouped_results[1], BaseException):
+            mx_rcode, mx_answers, mx_ttl = grouped_results[1]
+            if mx_rcode == 'NOERROR' and mx_answers:
+                record.records['MX'] = mx_answers
+                # Derive primary mx_host_final and its registered domain for downstream norms
+                try:
+                    first = mx_answers[0]
+                    parts = str(first).split(':', 1)
+                    host = parts[1] if len(parts) == 2 else str(first)
+                    host = host.rstrip('.')
+                    record.records['mx'] = host
+                    record.records['mx_host_final'] = host
+                    record.records['mx_domain'] = reg_domain(host) or ''
+                    record.records['mx_regdom_final'] = reg_domain(host) or ''
+                except Exception:
+                    pass
+            else:
+                record.errors['MX'] = mx_rcode
+            try:
+                record.meta['mx_ttl'] = int(mx_ttl) if mx_ttl is not None else None
+            except Exception:
+                pass
+        
+        # Process TXT
+        if not isinstance(grouped_results[2], BaseException):
+            txt_rcode, txt_answers, txt_ttl = grouped_results[2]
+            if txt_rcode == 'NOERROR' and txt_answers:
+                record.records['TXT'] = txt_answers
+            else:
+                record.errors['TXT'] = txt_rcode
+            try:
+                record.meta['txt_ttl'] = int(txt_ttl) if txt_ttl is not None else None
+            except Exception:
+                pass
+
+        # Process CAA (structured helper) and flag free CAs
+        if not isinstance(grouped_results[3], BaseException):
+            caa_rcode, caa_struct, caa_ttl = grouped_results[3]
+            if caa_rcode == 'NOERROR' and caa_struct:
+                # store string form for compatibility
+                caa_list = []
+                try:
+                    for e in caa_struct:
+                        fl = e.get('flags')
+                        tag = e.get('tag')
+                        val = e.get('value')
+                        caa_list.append(f"{fl} {tag} \"{val}\"")
+                except Exception:
+                    caa_list = [str(e) for e in caa_struct]
+                record.records['CAA'] = caa_list
+                record.meta['caa_struct'] = caa_struct
+                try:
+                    issuers: List[str] = []
+                    for entry in caa_list:
+                        s = str(entry).lower()
+                        if "letsencrypt" in s:
+                            issuers.append("letsencrypt")
+                        if "zerossl" in s:
+                            issuers.append("zerossl")
+                    record.meta['caa_free_ca_detected'] = str(bool(issuers))
+                    if issuers:
+                        record.meta['caa_issuers'] = list(set(issuers))
+                except Exception:
+                    pass
+            else:
+                record.errors['CAA'] = caa_rcode
+            try:
+                record.meta['caa_ttl'] = int(caa_ttl) if caa_ttl is not None else None
+            except Exception:
+                pass
+        
+        # Process NAPTR (structured helper)
+        if not isinstance(grouped_results[4], BaseException):
+            naptr_rcode, naptr_struct, naptr_ttl = grouped_results[4]
+            if naptr_rcode == 'NOERROR' and naptr_struct:
+                # store string form for compatibility
+                naptr_list = []
+                try:
+                    for e in naptr_struct:
+                        naptr_list.append(
+                            f"{e.get('order')} {e.get('preference')} \"{e.get('flags')}\" \"{e.get('services')}\" \"{e.get('regexp')}\" {e.get('replacement')}"
+                        )
+                except Exception:
+                    naptr_list = [str(e) for e in naptr_struct]
+                record.records['NAPTR'] = naptr_list
+                record.meta['naptr_struct'] = naptr_struct
+            else:
+                record.errors['NAPTR'] = naptr_rcode
+            try:
+                record.meta['naptr_ttl'] = int(naptr_ttl) if naptr_ttl is not None else None
+            except Exception:
+                pass
+
+        # SRV: Only for new domains (or when configured to always collect), focusing on high-risk services
+        try:
+            srv_mode = os.getenv('DNS_COLLECT_SRV', 'new_only').strip().lower()
+        except Exception:
+            srv_mode = 'new_only'
+        should_collect_srv = (srv_mode == 'always') or (srv_mode == 'new_only' and any_changed)
+        if should_collect_srv:
+            srv_services = ["_xmpp._tcp", "_sip._tcp"]
+            srv_records: Dict[str, Any] = {}
+            srv_errors: Dict[str, str] = {}
+            srv_tasks = [dns_lookup.lookup_srv_struct(f"{svc}.{domain}", resolver, semaphore) for svc in srv_services]
+            srv_results = await asyncio.gather(*srv_tasks, return_exceptions=True)
+            srv_ttl_map: Dict[str, int] = {}
+            for idx, svc in enumerate(srv_services):
+                res = srv_results[idx]
+                if isinstance(res, BaseException):
+                    continue
+                if not (isinstance(res, (tuple, list)) and len(res) >= 3):
+                    continue
+                rcode, srv_struct_list, ttl = res[0], res[1], res[2]
+                if rcode == 'NOERROR' and srv_struct_list:
+                    # Build compatibility string list and store structured entries in meta
+                    str_list = []
+                    try:
+                        for e in srv_struct_list:
+                            str_list.append(f"{e.get('priority')} {e.get('weight')} {e.get('port')} {e.get('target')}")
+                    except Exception:
+                        str_list = [str(e) for e in srv_struct_list]
+                    srv_records[svc] = str_list
+                    existing = record.meta.get('srv_struct', [])
+                    try:
+                        if isinstance(existing, list):
+                            record.meta['srv_struct'] = existing + srv_struct_list
+                        else:
+                            record.meta['srv_struct'] = srv_struct_list
+                    except Exception:
+                        record.meta['srv_struct'] = srv_struct_list
+                    try:
+                        if ttl is not None:
+                            srv_ttl_map[svc] = int(ttl)
+                    except Exception:
+                        pass
+                else:
+                    srv_errors[svc] = rcode
+            if srv_records:
+                record.records['SRV'] = srv_records
+            if srv_errors:
+                # Store detailed SRV errors under meta; summarize under errors
+                record.meta['srv_errors'] = srv_errors
+                record.errors['SRV'] = ", ".join([f"{svc}:{rcode}" for svc, rcode in srv_errors.items()])
+            if srv_ttl_map:
+                record.meta['srv_ttl'] = srv_ttl_map
+        
+        # Phase 4: Batch PTR lookups for all discovered IPs
+        all_ips = set()
+        for ip in a_answers:
+            all_ips.add(ip)
+        if 'AAAA' in record.records:
+            for ip in record.records['AAAA']:
+                all_ips.add(ip)
+        
+        if all_ips:
+            # Convert IPs to reverse DNS names
+            ptr_tasks = []
+            ptr_ips = []
+            for ip in all_ips:
+                try:
+                    # Create reverse DNS name
+                    ip_obj = ipaddress.ip_address(ip)
+                    reverse_name = ip_obj.reverse_pointer
+                    ptr_tasks.append(dns_lookup.lookup_ptr(reverse_name, resolver, semaphore))
+                    ptr_ips.append(ip)
+                except Exception:
+                    pass
+            
+            if ptr_tasks:
+                ptr_results = await asyncio.gather(*ptr_tasks, return_exceptions=True)
+                ptr_map = {}
+                for i, ip in enumerate(ptr_ips):
+                    entry = ptr_results[i]
+                    if isinstance(entry, BaseException):
+                        continue
+                    if not (isinstance(entry, (tuple, list)) and len(entry) >= 3):
+                        continue
+                    # Unpack only rcode and answers; TTL unused
+                    ptr_rcode, ptr_answers = entry[0], entry[1]
+                    if ptr_rcode == 'NOERROR' and ptr_answers:
+                        try:
+                            ptr_map[ip] = ptr_answers[0]  # Take first PTR
+                        except Exception:
+                            pass
+                if ptr_map:
+                    record.records['PTR'] = ptr_map
+        
+        # Phase 5: Check www and mail subdomains
+        registered = reg_domain(domain) or domain
+        # Include registered domain for downstream processing
+        record.records['registered_domain'] = registered
+        www_domain = f"www.{registered}"
+        mail_domain = f"mail.{registered}"
+        
+        # Check if www exists
+        www_check_rcode, www_check_answers, _ = await dns_lookup.lookup_a(www_domain, resolver, semaphore)
+        if www_check_rcode == 'NOERROR' and www_check_answers:
+            # www exists, fetch its records
+            www_a_task = dns_lookup.lookup_a(www_domain, resolver, semaphore)
+            www_aaaa_task = dns_lookup.lookup_aaaa(www_domain, resolver, semaphore)
+            www_results = await asyncio.gather(www_a_task, www_aaaa_task, return_exceptions=True)
+            
+            www_records = {}
+            if not isinstance(www_results[0], BaseException):
+                rcode, answers, ttl = www_results[0]
+                if rcode == 'NOERROR' and answers:
+                    www_records['A'] = answers
+            if not isinstance(www_results[1], BaseException):
+                rcode, answers, ttl = www_results[1]
+                if rcode == 'NOERROR' and answers:
+                    www_records['AAAA'] = answers
+            
+            if www_records:
+                record.records['www'] = www_records
+        
+        # Check if mail exists
+        mail_check_rcode, mail_check_answers, _ = await dns_lookup.lookup_a(mail_domain, resolver, semaphore)
+        if mail_check_rcode == 'NOERROR' and mail_check_answers:
+            # mail exists, fetch its records
+            mail_a_task = dns_lookup.lookup_a(mail_domain, resolver, semaphore)
+            mail_aaaa_task = dns_lookup.lookup_aaaa(mail_domain, resolver, semaphore)
+            mail_results = await asyncio.gather(mail_a_task, mail_aaaa_task, return_exceptions=True)
+            
+            mail_records = {}
+            if not isinstance(mail_results[0], BaseException):
+                rcode, answers, ttl = mail_results[0]
+                if rcode == 'NOERROR' and answers:
+                    mail_records['A'] = answers
+            if not isinstance(mail_results[1], BaseException):
+                rcode, answers, ttl = mail_results[1]
+                if rcode == 'NOERROR' and answers:
+                    mail_records['AAAA'] = answers
+            
+            if mail_records:
+                record.records['mail'] = mail_records
+        
+        return record
+        
+    except Exception as e:
+        record.status = 'error'
+        record.errors['exception'] = str(e)
+        log.error(f"Error fetching {domain}: {e}")
+        return record
+
+
+class DNSFetcher:
+    def __init__(
+        self,
+        domain: str,
+        smtp_banner_client: Optional[Any] = None,
+        logger=None,
+        run_blocking_probes: bool = False,
+        fetch_mta_sts_policy: bool = True,
+        domain_timeout_s: float = 5.0,
+        lookup: Optional[DNSLookup] = None,
+    ):
+        self.domain = domain.rstrip(".").lower()
+        if logger is None:
+            logger = log.bind(component="dns_fetcher").info
+        self.log = logger
+        self.smtp_banner_client = smtp_banner_client
+        self._run_blocking_probes = bool(run_blocking_probes)
+        self._fetch_mta_sts_policy = bool(fetch_mta_sts_policy)
+        self._domain_timeout_s = domain_timeout_s
+
+        # Ensure we always have a DNSLookup instance with required methods
+        if lookup is None or not hasattr(lookup, "resolve_a_aaaa"):
+            lookup = DNSLookup()
+        self.lookup = lookup
+    @staticmethod
+    def _core_noerror_exists(
+        a_list: Optional[List[str]],
+        a_err: Optional[str],
+        ns_list: Optional[List[str] | str],
+        ns_err: Optional[str],
+        soa_mname: Optional[str],
+        soa_err: Optional[str],
+    ) -> bool:
+        try:
+            a_ok = (not a_err) and bool(a_list)
+        except Exception:
+            a_ok = False
+        try:
+            ns_ok = (not ns_err) and bool(ns_list)
+        except Exception:
+            ns_ok = False
+        try:
+            soa_ok = (not soa_err) and bool(soa_mname)
+        except Exception:
+            soa_ok = False
+        return a_ok or ns_ok or soa_ok
+
+    async def fetch_records(self) -> Optional[DNSRecords]:
+        try:
+            return await asyncio.wait_for(self._fetch_records_inner(), timeout=self._domain_timeout_s)
+        except asyncio.TimeoutError:
+            try:
+                self.log(f"[{self.domain}] fetch_records overall timeout after {self._domain_timeout_s}s - returning partial/None")
+            except Exception:
+                pass
+            return None
+
+    async def _fetch_records_inner(self) -> Optional[DNSRecords]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # Normalize domain and get registered domain
+        try:
+            domain_ascii = to_ascii_hostname(self.domain)
+        except Exception:
+            domain_ascii = self.domain
+        registered = reg_domain(domain_ascii) or domain_ascii
+
+        expanded: Optional[Dict[str, Any]] = None
+        fetch_domain = getattr(self.lookup, "fetch_domain", None)
+        if callable(fetch_domain):
+            self.log(f"[{self.domain}] using lookup.fetch_domain()")

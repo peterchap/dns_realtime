@@ -1,0 +1,90 @@
+version: "2025.10.20-rc1"
+
+profiles:
+
+  default:
+    max_score: 100
+    min_score: 0
+    thresholds: { critical: 80, high: 60, medium: 30 }
+
+    positive_rules:
+      - { name: phishing_hit,        column: is_phishing,        points: 40 }
+      - { name: malware_hit,         column: is_malware,         points: 30 }
+      - { name: newly_registered,    column: is_new_domain,      points: 8  }
+      - { name: nameserver_changed,  column: ns_changed,         points: 3  }
+      - { name: ip_changed,          column: ip_changed,         points: 4  }
+      - { name: geo_changed,         column: country_changed,    points: 3  }
+      - { name: ttl_drop_large,      column: ttl_drop_big,       points: 4  }
+      - { name: dynamic_infra,       column: is_dynamic_dns,     points: 6  }
+      - { name: ugc_or_platform,     column: is_cdn_ugc,         points: 3  }
+      - { name: mx_misconfig,        column: mx_misconfigured_provider, points: 2 }
+      - { name: self_hosted_mx_vanity, when: { column: mx_self_hosted_candidate, equals: true }, points: 3 }
+      - { name: banner_unknown_when_self_hosted, when: { column: mx_banner_inferred, equals: false }, points: 2 }
+    trust_rules:
+      - { name: ns_provider_trust, column: provider_trust_nudge, points: 0 }
+      - { name: mx_provider_trust, column: mx_trust_nudge,       points: 0 }
+      - { name: top_100k_site, when: { column: is_top_100k, equals: true }, points: 12 }
+      - { name: top_1m_site,  when: { column: is_top_1m,  equals: true }, points: 6  }
+      - { name: banner_enterprise, when: { column: mx_banner_category, in: ["enterprise","seg"] }, points: 8 }
+
+    mapped_rules:
+      - name: network_risk
+        column: asn_risk_level
+        map: { suspicious: 2, malicious: 4, critical: 8 }
+
+    direct_add_columns: [ parking_points, subdomain_points ]
+    direct_sub_columns: [ ]
+
+  email_security:
+    max_score: 100
+    min_score: 0
+    thresholds: { critical: 70, high: 50, medium: 25 }
+
+    positive_rules:
+      - { name: phishing_hit,     column: is_phishing,   points: 35 }
+      - { name: malware_hit,      column: is_malware,    points: 25 }
+      - { name: newly_registered, column: is_new_domain, points: 10 }
+      - { name: spf_block,        column: is_spf_block,  points: 6  }
+      - { name: dmarc_absent,     when: { column: dmarc, equals: "" }, points: 4 }
+      - { name: self_hosted_mx,   when: { column: mx_mbp_category, equals: "self_hosted_mail" }, points: 3 }
+      - { name: self_hosted_mx_vanity, when: { column: mx_self_hosted_candidate, equals: true }, points: 4 }
+      - { name: banner_unknown_when_self_hosted, when: { column: mx_banner_inferred, equals: false }, points: 3 }
+
+    trust_rules:
+      - { name: ns_provider_trust, column: provider_trust_nudge, points: 0 }
+      - { name: mx_provider_trust, column: mx_trust_nudge,       points: 0 }
+      - { name: top_1m_site, when: { column: is_top_1m, equals: true }, points: 6 }
+      - { name: banner_enterprise, when: { column: mx_banner_category, in: ["enterprise","seg"] }, points: 10 }
+
+    mapped_rules:
+      - name: network_risk
+        column: asn_risk_level
+        map: { suspicious: 2, malicious: 4, critical: 6 }
+
+    direct_add_columns: [ parking_points ]
+    direct_sub_columns: [ ]
+
+  cyber_threat:
+    max_score: 100
+    min_score: 0
+    thresholds: { critical: 70, high: 45, medium: 20 }
+
+    positive_rules:
+      - { name: phishing_hit,        column: is_phishing,        points: 45 }
+      - { name: malware_hit,         column: is_malware,         points: 35 }
+      - { name: newly_registered,    column: is_new_domain,      points: 10 }
+      - { name: dynamic_infra,       column: is_dynamic_dns,     points: 8  }
+      - { name: suspicious_subdom,   when: { column: subdomain_points, in: [6,7,8,9,10] }, points: 6 }
+      - { name: mx_misconfig,        column: mx_misconfigured_provider, points: 3 }
+
+    trust_rules:
+      - { name: ns_provider_trust, column: provider_trust_nudge, points: 0 }
+      - { name: mx_provider_trust, column: mx_trust_nudge,       points: 0 }
+
+    mapped_rules:
+      - name: network_risk
+        column: asn_risk_level
+        map: { suspicious: 3, malicious: 6, critical: 10 }
+
+    direct_add_columns: [ parking_points, subdomain_points ]
+    direct_sub_columns: [ ]

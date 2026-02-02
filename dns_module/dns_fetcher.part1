@@ -1,0 +1,406 @@
+from __future__ import annotations
+import asyncio
+import datetime
+import inspect
+import sys
+import os
+import traceback
+import ipaddress
+from .logger import get_child_logger
+from typing import Optional, List, Any, Dict, cast, Iterable, Tuple
+from dotenv import load_dotenv
+
+load_dotenv()
+
+try:
+    from .dns_records import DNSRecords, DNSRecord
+except Exception:
+    # Print helpful debug info to stderr (will appear in container logs / celery worker logs)
+    sys.stderr.write("Failed to import dns_module.dns_records\n")
+    sys.stderr.write(f"CWD: {os.getcwd()}\n")
+    sys.stderr.write("sys.path:\n")
+    for p in sys.path:
+        sys.stderr.write(f"  {p}\n")
+    sys.stderr.write("Traceback:\n")
+    traceback.print_exc(file=sys.stderr)
+    # Re-raise so the original ImportError is preserved (so your process stops)
+    raise
+
+# Import the dns_lookup module used throughout this file
+try:
+    from . import dns_lookup
+except Exception:
+    # Print helpful debug info to stderr (will appear in container logs / celery worker logs)
+    sys.stderr.write("Failed to import dns_module.dns_lookup\n")
+    sys.stderr.write(f"CWD: {os.getcwd()}\n")
+    sys.stderr.write("sys.path:\n")
+    for p in sys.path:
+        sys.stderr.write(f"  {p}\n")
+    sys.stderr.write("Traceback:\n")
+    traceback.print_exc(file=sys.stderr)
+    # Re-raise so the original ImportError is preserved (so your process stops)
+    raise
+
+
+from .probes import probe_https_cert, probe_smtp_starttls_cert
+from .policy import detect_mta_sts, fetch_tlsrpt_rua
+from .dns_utils import (
+    to_ascii_hostname, reg_domain, ip_to_int,
+    parse_smtp_banner, infer_mbp_from_banner,
+    list_to_string
+)
+
+# Default workers for batch mode
+DEFAULT_BATCH_WORKERS = 200
+
+log = get_child_logger("dns_fetcher")
+
+# Simple free CA detection for CAA records
+FREE_CA_KEYWORDS = ["letsencrypt", "zerossl"]
+
+class DNSLookup:
+    """
+    Compatibility wrapper that provides a minimal shim for the legacy DNSLookup class
+    used by DNSFetcher. It delegates to the new dns_lookup module functions.
+    """
+
+    def __init__(
+        self,
+        dns_timeout_s: float = 5.0,
+        retries: int = 2,
+        per_domain_max_concurrency: int = 20,
+        logger: Optional[Any] = None,
+        nameservers: Optional[List[str]] = None,
+        semaphore: Optional[asyncio.Semaphore] = None,
+    ):
+        self.dns_timeout_s = dns_timeout_s
+        self.retries = retries
+        self.per_domain_max_concurrency = per_domain_max_concurrency
+        self.log = logger if logger is not None else (lambda *a, **k: None)
+        # allow optional override of resolver via dns_lookup.set_default_resolver from application
+        # nameservers handled by dns_lookup.get_default_resolver(nameservers=...)
+        # Prefer local Unbound by default; allow env override via DNS_NAMESERVERS (comma-separated)
+        if nameservers is None:
+            ns_env = os.getenv("DNS_NAMESERVERS", "127.0.0.1")
+            self.nameservers = [s.strip() for s in ns_env.split(",") if s.strip()]
+        else:
+            self.nameservers = nameservers
+        # Build a resolver upfront so we pass it consistently to all lookups
+        try:
+            self.resolver = dns_lookup.get_default_resolver(nameservers=self.nameservers)
+        except Exception:
+            # Fallback to module default resolver
+            self.resolver = dns_lookup.get_default_resolver()
+
+        # Shared semaphore for throttling all lookups from this instance
+        self.semaphore = semaphore or dns_lookup.default_semaphore()
+
+    # --- Basic lookups return shapes compatible with existing callers ---
+
+    async def resolve_ns_first(self, name: str) -> Tuple[List[str], int, Optional[str]]:
+        """Return (ns_answers_list, ttl, error_code_or_empty)."""
+        try:
+            rcode, answers, ttl = await dns_lookup.lookup_ns(name, resolver=self.resolver, semaphore=self.semaphore)
+            if rcode == "NOERROR" and answers:
+                return answers, ttl, None
+            return [], ttl, rcode
+        except Exception:
+            return [], 0, "ERROR"
+
+    async def resolve_soa(self, name: str) -> Tuple[Optional[str], int, Optional[int], Optional[str]]:
+        """
+        Return (mname, ttl, soa_serial, error_code_or_none)
+        If SOA not present, return (None, 0, None, rcode)
+        """
+        try:
+            rcode, answers, ttl = await dns_lookup.lookup_soa(name, resolver=self.resolver, semaphore=self.semaphore)
+            if rcode == "NOERROR" and answers:
+                # answers list contains SOA objects or mname; normalize to string first entry
+                first = answers[0] if isinstance(answers, list) and answers else None
+                # We cannot reliably parse serial here from dnspython-lite answers; return None for serial
+                return str(first) if first else None, ttl, None, None
+            return None, ttl, None, rcode
+        except Exception:
+            return None, 0, None, "ERROR"
+
+    async def resolve_a_aaaa(self, name: str, want_ipv6: bool = True) -> Tuple[List[str], List[str], int, Optional[str]]:
+        """
+        Return (a_list, aaaa_list, ttl_min, error_code_or_none)
+        """
+        a_list: List[str] = []
+        aaaa_list: List[str] = []
+        ttl_min = 0
+        err = None
+        try:
+            rcode_a, answers_a, ttl_a = await dns_lookup.lookup_a(name, resolver=self.resolver, semaphore=self.semaphore)
+            if rcode_a == "NOERROR" and answers_a:
+                a_list = answers_a
+                ttl_min = ttl_a
+            else:
+                err = rcode_a
+
+            if want_ipv6:
+                rcode_aaaa, answers_aaaa, ttl_aaaa = await dns_lookup.lookup_aaaa(name, resolver=self.resolver, semaphore=self.semaphore)
+                if rcode_aaaa == "NOERROR" and answers_aaaa:
+                    aaaa_list = answers_aaaa
+                    ttl_min = ttl_min or ttl_aaaa
+                else:
+                    if err is None:
+                        err = rcode_aaaa
+            return a_list, aaaa_list, ttl_min, err
+        except Exception:
+            return [], [], 0, "ERROR"
+
+    async def dnssec_flag(self, name: str) -> Optional[bool]:
+        """Simple probe for DNSSEC: attempt to lookup DNSKEY and return True if present."""
+        try:
+            rcode, answers, ttl = await dns_lookup.perform_lookup("DNSKEY", name, resolver=self.resolver, semaphore=self.semaphore)
+            return bool(rcode == "NOERROR" and answers)
+        except Exception:
+            return None
+
+    async def _retry_resolve(self, name: str, rtype: str):
+        """
+        Minimal retry wrapper used by legacy code for CNAME checks etc.
+        Returns a tuple whose first item is an iterable of rrset-like objects (we provide raw answers list).
+        """
+        try:
+            rcode, answers, ttl = await dns_lookup.perform_lookup(rtype, name, resolver=self.resolver, semaphore=self.semaphore)
+            # return a tuple with first element answers (so calling code using resp[0] works)
+            return (answers if answers else [],)
+        except Exception:
+            return ([],)
+
+    async def resolve_mx_primary(self, name: str) -> Tuple[Optional[str], int, Optional[str]]:
+        """
+        Return (mx_host_input, mx_pref, err_code)
+        dns_lookup.lookup_mx returns strings like "10:mx.example.com"
+        """
+        try:
+            rcode, answers, ttl = await dns_lookup.lookup_mx(name, resolver=self.resolver, semaphore=self.semaphore)
+            if rcode == "NOERROR" and answers:
+                # choose first MX entry and parse "pref:host" or "pref:host."
+                first = answers[0]
+                parts = str(first).split(":", 1)
+                if len(parts) == 2:
+                    pref = int(parts[0])
+                    host = parts[1].rstrip(".")
+                    return host, pref, None
+                else:
+                    return str(first).rstrip("."), 0, None
+            return None, 0, rcode
+        except Exception:
+            return None, 0, "ERROR"
+
+    async def resolve_txt_join(self, name: str) -> List[str]:
+        """
+        Return a list of TXT strings (joined components).
+        """
+        try:
+            rcode, answers, ttl = await dns_lookup.lookup_txt(name, resolver=self.resolver, semaphore=self.semaphore)
+            if answers:
+                return [str(a) for a in answers]
+            return []
+        except Exception:
+            return []
+
+    async def resolve_txt_joined(self, name: str) -> str:
+        """
+        Return joined TXT string (used by policy.detect_mta_sts style helpers).
+        """
+        try:
+            txts = await self.resolve_txt_join(name)
+            return "".join(txts)
+        except Exception:
+            return ""
+
+    async def resolve_ptr_first(self, ip: str) -> str:
+        """
+        Return first PTR target for an IPv4/IPv6 string (or empty string on error).
+        """
+        try:
+            # construct reverse pointer from ipaddress lib
+            try:
+                ptr_name = ipaddress.ip_address(ip).reverse_pointer
+            except Exception:
+                # fallback to direct PTR lookup if ip isn't parseable
+                return ""
+            rcode, answers, ttl = await dns_lookup.lookup_ptr(ptr_name, resolver=self.resolver, semaphore=self.semaphore)
+            if rcode == "NOERROR" and answers:
+                return answers[0]
+            return ""
+        except Exception:
+            return ""
+
+    async def resolve_ptr_once(self, ip: str) -> str:
+        """Alias to resolve_ptr_first"""
+        return await self.resolve_ptr_first(ip)
+
+    async def resolve_ptr_first_raw(self, reverse_name: str):
+        """Return raw ptr answers for a reverse name"""
+        try:
+            rcode, answers, ttl = await dns_lookup.lookup_ptr(reverse_name, resolver=self.resolver, semaphore=self.semaphore)
+            return answers if answers else []
+        except Exception:
+            return []
+
+    async def cname_chain(self, name: str, limit: int = 8) -> Tuple[str, List[str]]:
+        """
+        Try to follow CNAMEs up to `limit`. Returns (final_name, chain_list).
+        Uses perform_lookup('CNAME', ...) to find next hop.
+        """
+        chain: List[str] = []
+        cur = name
+        hops = 0
+        try:
+            while hops < limit:
+                rcode, answers, ttl = await dns_lookup.perform_lookup("CNAME", cur, resolver=self.resolver, semaphore=self.semaphore)
+                # answers will be list of CNAME targets as strings (depending on resolver)
+                if not answers:
+                    break
+                next_host = str(answers[0]).rstrip(".")
+                if next_host == cur or not next_host:
+                    break
+                chain.append(next_host)
+                cur = next_host
+                hops += 1
+            return cur, chain
+        except Exception:
+            return name, chain
+
+    async def fetch_domain(self, domain: str, retry_limit: int = 1) -> DNSRecord:
+        """
+        Provide a shim that delegates to module-level fetch_domain using this instance's resolver.
+        """
+        return await fetch_domain(domain, resolver=self.resolver, semaphore=self.semaphore, retry_limit=retry_limit)
+
+async def fetch_domain(
+    domain: str,
+    resolver: Optional[Any] = None,
+    semaphore: Optional[asyncio.Semaphore] = None,
+    retry_limit: int = 1
+) -> DNSRecord:
+    """
+    Fetch DNS records for a domain using the new dns_lookup module.
+    
+    This function implements the operational design:
+    - Fetches core records (NS, SOA, A) concurrently
+    - Uses check_changed_and_enqueue_update to detect changes
+    - Retries failed core lookups up to retry_limit
+    - Fetches grouped records (AAAA, MX, TXT) if core succeeds
+    - Batches PTR lookups for discovered IPs
+    - Checks www/mail subdomain presence before fetching
+    
+    Args:
+        domain: Domain name to fetch.
+        resolver: DNS resolver (uses default if None).
+        semaphore: Throttling semaphore (uses default if None).
+        retry_limit: Maximum retries for failed core lookups.
+    
+    Returns:
+        DNSRecord with status, records, errors, and meta.
+    """
+    domain = domain.rstrip('.').lower()
+    record = DNSRecord(domain=domain, status='error')
+    
+    # Get defaults if not provided: prefer local Unbound by default
+    if resolver is None:
+        try:
+            ns_env = os.getenv("DNS_NAMESERVERS", "127.0.0.1")
+            ns_list = [s.strip() for s in ns_env.split(",") if s.strip()]
+            resolver = dns_lookup.get_default_resolver(nameservers=ns_list)
+        except Exception:
+            resolver = dns_lookup.get_default_resolver()
+    if semaphore is None:
+        semaphore = dns_lookup.default_semaphore()
+    
+    try:
+        # Phase 1: Fetch core records concurrently (NS, SOA, A)
+        core_tasks = [
+            dns_lookup.lookup_ns(domain, resolver, semaphore),
+            dns_lookup.lookup_soa(domain, resolver, semaphore),
+            dns_lookup.lookup_a(domain, resolver, semaphore),
+        ]
+        
+        core_results = await asyncio.gather(*core_tasks, return_exceptions=True)
+        
+        # Unpack core results
+        ns_rcode, ns_answers, ns_ttl = core_results[0] if not isinstance(core_results[0], BaseException) else ('ERROR', [], 0)
+        soa_rcode, soa_answers, soa_ttl = core_results[1] if not isinstance(core_results[1], BaseException) else ('ERROR', [], 0)
+        a_rcode, a_answers, a_ttl = core_results[2] if not isinstance(core_results[2], BaseException) else ('ERROR', [], 0)
+        
+        # Store core rcodes in meta
+        record.meta['ns_rcode'] = ns_rcode
+        record.meta['soa_rcode'] = soa_rcode
+        record.meta['a_rcode'] = a_rcode
+        
+        # Check if domain is dormant or needs retry depending on core rcodes
+        all_nxdomain = all(rc == 'NXDOMAIN' for rc in [ns_rcode, soa_rcode, a_rcode])
+        all_servfail = all(rc == 'SERVFAIL' for rc in [ns_rcode, soa_rcode, a_rcode])
+        all_timeout = all(rc == 'TIMEOUT' for rc in [ns_rcode, soa_rcode, a_rcode])
+
+        if all_nxdomain:
+            record.status = 'dormant'
+            record.errors['core'] = 'All core lookups failed (NXDOMAIN)'
+            return record
+        if all_servfail:
+            record.status = 'needs_retry'
+            record.errors['core'] = 'All core lookups SERVFAIL'
+            return record
+        if all_timeout:
+            record.status = 'needs_retry'
+            record.errors['core'] = 'All core lookups timed out'
+            return record
+        
+        # Check which core lookups succeeded
+        core_ok = {
+            'ns': ns_rcode == 'NOERROR' and ns_answers,
+            'soa': soa_rcode == 'NOERROR' and soa_answers,
+            'a': a_rcode == 'NOERROR' and a_answers,
+        }
+        
+        # Log core rcodes to aid diagnosis
+        try:
+            log.info("core rcodes for {}: ns={} soa={} a={}", domain, ns_rcode, soa_rcode, a_rcode)
+        except Exception:
+            pass
+
+        # If some core lookups failed, retry them
+        if not all(core_ok.values()):
+            for attempt in range(retry_limit):
+                retry_tasks = []
+                retry_types = []
+                
+                if not core_ok['ns']:
+                    retry_tasks.append(dns_lookup.lookup_ns(domain, resolver, semaphore))
+                    retry_types.append('ns')
+                if not core_ok['soa']:
+                    retry_tasks.append(dns_lookup.lookup_soa(domain, resolver, semaphore))
+                    retry_types.append('soa')
+                if not core_ok['a']:
+                    retry_tasks.append(dns_lookup.lookup_a(domain, resolver, semaphore))
+                    retry_types.append('a')
+                
+                if not retry_tasks:
+                    break
+                
+                # Small backoff between retries
+                if attempt > 0:
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                
+                retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+                
+                # Update results
+                for i, rtype in enumerate(retry_types):
+                    result = retry_results[i]
+                    # Skip if an exception was returned
+                    if isinstance(result, BaseException):
+                        continue
+                    # Ensure result is an iterable with at least 3 elements before unpacking
+                    if not (isinstance(result, (tuple, list)) and len(result) >= 3):
+                        log.debug(f"{domain} unexpected retry result type for {rtype}: {type(result)}")
+                        continue
+                    rcode, answers, ttl = result[0], result[1], result[2]
+                    if rtype == 'ns' and rcode == 'NOERROR' and answers:
+                        ns_rcode, ns_answers, ns_ttl = rcode, answers, ttl
+                        core_ok['ns'] = True

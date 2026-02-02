@@ -1,0 +1,113 @@
+        (
+            mx_host_final,
+            mx_regdom_final,
+            mx_cname_chain,
+            mx_under_customer,
+            mx_ips,
+            mx_ptr_first,
+            mx_ptr_regdom_first,
+            mx_banner_raw,
+            mx_banner_host,
+            mx_banner_details,
+            mx_banner_provider,
+            mx_banner_category,
+            mx_domain,
+            mx_tld,
+            spf_txt,
+            dmarc_txt,
+            bimi_txt,
+            status,
+            mta_sts_txt,
+            mta_sts_mode,
+            mta_sts_max_age,
+            mta_sts_id,
+            has_mta_sts,
+            tlsrpt_rua,
+            https_ok,
+            https_days,
+            https_issuer,
+            https_san,
+            smtp_ok,
+            smtp_days,
+            smtp_issuer,
+        ) = await _gather_mx_data(mx_host_input)
+
+        # WWW host
+        www_host = f"www.{registered}" if registered else ""
+        try:
+            www_a_list, _, _, _ = await self.lookup.resolve_a_aaaa(www_host)
+        except Exception:
+            www_a_list = []
+        www_a_first = www_a_list[0] if www_a_list else ""
+        www_int = ip_to_int(www_a_first) if www_a_first else 0
+        www_ptr = ""
+        # MAIL host
+        mail_host = f"mail.{registered}" if registered else ""
+        try:
+            mail_a_list, _, _, _ = await self.lookup.resolve_a_aaaa(mail_host, want_ipv6=True)
+        except Exception:
+            mail_a_list = []
+        mail_a_first = mail_a_list[0] if mail_a_list else ""
+        mail_int = ip_to_int(mail_a_first) if mail_a_first else 0
+        mail_ptr = ""
+        try:
+            if mail_a_first:
+                mail_ptr = await self.lookup.resolve_ptr_first(mail_a_first)
+        except Exception:
+            mail_ptr = ""
+        mail_cname = ""
+        try:
+            resp_mail_cname = await self.lookup._retry_resolve(mail_host, "CNAME")
+            if resp_mail_cname and resp_mail_cname[0]:
+                rr = next(iter(resp_mail_cname[0]), None)
+                if rr:
+                    mail_cname = str(getattr(rr, "cname", getattr(rr, "target", getattr(rr, "name", rr)))).rstrip(".").lower()
+        except Exception:
+            mail_cname = ""
+        mail_ptr = ""
+        try:
+            if mail_a_list:
+                mail_ptr = await self.lookup.resolve_ptr_first(mail_a_list[0])
+        except Exception:
+            mail_ptr = ""
+        mail_cname = ""
+        try:
+            resp_mail_cname = await self.lookup._retry_resolve(mail_host, "CNAME")
+            if resp_mail_cname and resp_mail_cname[0]:
+                rr = next(iter(resp_mail_cname[0]), None)
+                if rr:
+                    mail_cname = str(getattr(rr, "cname", getattr(rr, "target", getattr(rr, "name", rr)))).rstrip(".").lower()
+        except Exception:
+            mail_cname = ""
+
+        # Compose record with the same fields as your original implementation
+        a_ttl = ttl_min or 0
+        ns1_list = ns1_val if isinstance(ns1_val, list) else ([ns1_val] if ns1_val else [])
+        ns1_list_str = [str(x) for x in ns1_list] if ns1_list else []
+        ns1_str = list_to_string(ns1_list_str) if ns1_list_str else ""
+        a_str = list_to_string(a_list) if a_list else ""
+        aaaa_str = list_to_string(aaaa_list) if aaaa_list else ""
+
+        rec = DNSRecords(
+            domain=self.domain,
+            registered_domain=registered,
+            ns1=ns1_str,
+            soa=soa_mname or "",
+            status=status or "",
+            ns_error=ns_err or "",
+            soa_error=soa_err or "",
+            a_error=a_err or "",
+            a=a_str,
+            aaaa=aaaa_str,
+            ip_int=ip_to_int(a_list[0]) if a_list else 0,
+            a_ttl=a_ttl,
+            ptr=ptr_apex or "",
+            cname=apex_cname or "",
+            mx=mx_host_input or "",
+            mx_priority=mx_pref or 0,
+            mx_host_final=mx_host_final or "",
+            mx_regdom_final=mx_regdom_final or "",
+            mx_cname_chain=mx_cname_chain or [],
+            mx_under_customer=bool(mx_under_customer),
+            mx_banner_raw=mx_banner_raw or "",
+            mx_banner_host=mx_banner_host or "",

@@ -1,0 +1,200 @@
+            try:
+                fetch_result = fetch_domain(domain_ascii)
+                if inspect.isawaitable(fetch_result):
+                    # Allow a slightly higher ceiling than per-record timeout
+                    expanded = await asyncio.wait_for(fetch_result, timeout=self._domain_timeout_s)
+                else:
+                    # Run synchronous implementation in thread
+                    raw_result = await asyncio.wait_for(asyncio.to_thread(fetch_domain, domain_ascii), timeout=self._domain_timeout_s)
+                    expanded = cast(Dict[str, Any], raw_result) if isinstance(raw_result, dict) else None
+            except asyncio.TimeoutError:
+                self.log(f"[{self.domain}] fetch_domain timeout after {self._domain_timeout_s}s")
+            except Exception as e:
+                self.log(f"[{self.domain}] fetch_domain failed: {e}")
+                expanded = None
+
+        # If we got an expanded dict, use its cached results; otherwise fall back to legacy probes.
+        if expanded:
+            # Core fields
+            ns_list = expanded.get("ns") or []
+            if isinstance(ns_list, list) and ns_list:
+                ns1_str = list_to_string([str(x) for x in ns_list])
+            elif isinstance(ns_list, str) and ns_list:
+                ns1_str = list_to_string([ns_list])
+            else:
+                ns1_str = ""
+            soa_mname = expanded.get("soa") or ""
+            a_list = expanded.get("a") or []
+            aaaa_list = expanded.get("aaaa") or []
+            a_err = expanded.get("a_error") or ""
+            ns_err = expanded.get("ns_error") or ""
+            soa_err = expanded.get("soa_error") or ""
+            status = (expanded.get("status") or "").upper()
+            hosts = expanded.get("hosts") or {}
+            ptrs = expanded.get("ptrs") or {}
+
+            # If domain is dormant (NXDOMAIN on A, NS, SOA) - skip further lookups
+            if a_err == "NXDOMAIN" and ns_err == "NXDOMAIN" and soa_err == "NXDOMAIN":
+                self.log(f"[{self.domain}] Domain is dormant (NXDOMAIN on A, NS, SOA) - skipping further lookups")
+                return None
+
+            # Gate: require at least one of A/NS/SOA to exist and be NOERROR
+            if not self._core_noerror_exists(a_list, a_err, ns_list, ns_err, soa_mname, soa_err):
+                self.log(f"[{self.domain}] No core NOERROR records (A/NS/SOA) with data - aborting further lookups")
+                return None
+
+            # If NOERROR for at least one core record, retry the core records one time (only the ones missing/errored)
+            need_retry_a = bool(a_err or not a_list)
+            need_retry_ns = bool(ns_err or not ns_list)
+            need_retry_soa = bool(soa_err or not soa_mname)
+            if need_retry_ns:
+                ns1_retry, _, ns_err_retry = await self.lookup.resolve_ns_first(domain_ascii)
+                if not ns_err_retry and ns1_retry:
+                    ns_list = ns1_retry
+                    ns_err = ""
+                    ns1_str = list_to_string([str(x) for x in ns_list]) if isinstance(ns_list, list) else list_to_string([str(ns_list)])
+            if need_retry_soa:
+                soa_mname_retry, _, _, soa_err_retry = await self.lookup.resolve_soa(domain_ascii)
+                if not soa_err_retry and soa_mname_retry:
+                    soa_mname = soa_mname_retry
+                    soa_err = ""
+            if need_retry_a:
+                try:
+                    a_retry, aaaa_retry, ttl_retry, a_err_retry = await self.lookup.resolve_a_aaaa(domain_ascii)
+                    if not a_err_retry and a_retry:
+                        a_list = a_retry
+                        aaaa_list = aaaa_retry or aaaa_list
+                        a_err = ""
+                        expanded["ttl"] = ttl_retry or expanded.get("ttl", 0)
+                except Exception as e:
+                    self.log(f"[{self.domain}] core retry failed: {e}")
+
+            # If core probes show SERVFAIL/REFUSED/ERROR, allow one retry then give up
+            if status in ("SERVFAIL", "REFUSED", "ERROR"):
+                self.log(f"[{self.domain}] Core probes returned {status}, retrying once after backoff")
+                try:
+                    await asyncio.sleep(0.5)
+                    # Simple re-resolve of core records
+                    ns1_retry, _, ns_err_retry = await self.lookup.resolve_ns_first(domain_ascii)
+                    if not ns_err_retry and ns1_retry:
+                        ns_list = ns1_retry
+                        ns_err = ""
+                        ns1_str = list_to_string([str(x) for x in ns_list]) if isinstance(ns_list, list) else list_to_string([str(ns_list)])
+                    soa_mname_retry, _, _, soa_err_retry = await self.lookup.resolve_soa(domain_ascii)
+                    if not soa_err_retry and soa_mname_retry:
+                        soa_mname = soa_mname_retry
+                        soa_err = ""
+                    a_retry, aaaa_retry, ttl_retry, a_err_retry = await self.lookup.resolve_a_aaaa(domain_ascii)
+                    if not a_err_retry and a_retry:
+                        a_list = a_retry
+                        aaaa_list = aaaa_retry or aaaa_list
+                        a_err = ""
+                        expanded["ttl"] = ttl_retry or expanded.get("ttl", 0)
+                    status = "NOERROR" if self._core_noerror_exists(a_list, a_err, ns_list, ns_err, soa_mname, soa_err) else status
+                except Exception as e:
+                    self.log(f"[{self.domain}] retry core probes failed: {e}")
+                    return None
+
+            # Determine MX info
+            mx_list = expanded.get("mx") or []
+            mx_host_input = ""
+            mx_pref = 0
+            if isinstance(mx_list, list) and mx_list:
+                # mx_list expected as list of (pref, host) tuples from DNSLookup._extract_mx
+                first = mx_list[0]
+                if isinstance(first, (list, tuple)) and len(first) >= 2:
+                    mx_pref = int(first[0]) if first[0] is not None else 0
+                    mx_host_input = first[1] or ""
+                else:
+                    # fallback if mx_list is list of hosts or strings
+                    mx_host_input = str(first)
+            elif isinstance(mx_list, str) and mx_list:
+                mx_host_input = mx_list
+
+            # If mx_host_input present, try to obtain its resolved IPs from hosts cache
+            mx_host_final = mx_host_input or ""
+            mx_cname_chain = []
+            mx_ips: List[str] = []
+            mx_ptr_first = ""
+            mx_ptr_regdom_first = ""
+            mx_regdom_final = ""
+            mx_under_customer = False
+
+            if mx_host_final:
+                host_info = hosts.get(mx_host_final, {}) if hosts else {}
+                mx_ips = host_info.get("a", []) + host_info.get("aaaa", []) if host_info else []
+                # if missing, fallback to lookup.cname_chain + resolve_a_aaaa
+                if not mx_ips:
+                    try:
+                        mx_host_final_try, chain = await self.lookup.cname_chain(mx_host_final, limit=5)
+                        mx_cname_chain = chain or []
+                        mx_host_final = mx_host_final_try or mx_host_final
+                    except Exception:
+                        mx_cname_chain = []
+                    try:
+                        mx_a, mx_aaaa, _, _ = await self.lookup.resolve_a_aaaa(mx_host_final)
+                        mx_ips = (mx_a or []) + (mx_aaaa or [])
+                    except Exception:
+                        mx_ips = []
+
+                if mx_ips:
+                    mx_ptr_first = ptrs.get(mx_ips[0]) if ptrs and mx_ips[0] in ptrs else await self.lookup.resolve_ptr_once(mx_ips[0])
+                    mx_ptr_regdom_first = reg_domain(mx_ptr_first) if mx_ptr_first else ""
+                mx_regdom_final = reg_domain(mx_host_final) if mx_host_final else ""
+                mx_under_customer = bool(mx_regdom_final and mx_regdom_final == registered)
+
+            # TXT/SPF/DMARC and MTA-STS/TLSRPT
+            spf_txt = ""
+            dmarc_txt = ""
+            bimi_txt = ""
+            try:
+                # expand may have txt entries for apex; if not, fall back to lookup helpers
+                txts = expanded.get("txt") or []
+                if txts:
+                    # normalize bytes/objects to strings
+                    txt_norm = []
+                    for t in txts:
+                        if isinstance(t, (bytes, bytearray)):
+                            txt_norm.append(t.decode(errors="ignore"))
+                        else:
+                            txt_norm.append(str(t))
+                    # find spf/dmarc/bimi among returned texts
+                    spf_txt = next((t for t in txt_norm if "v=spf1" in t.lower()), "")
+                    dmarc_txt = next((t for t in txt_norm if t.lower().startswith("v=dmarc")), "")
+                    bimi_txt = next((t for t in txt_norm if "v=bimi" in t.lower()), "")
+                else:
+                    # fallback queries
+                    try:
+                        dmarc_txt = next((t for t in (await self.lookup.resolve_txt_join(f"_dmarc.{registered}")) if "v=dmarc" in t.lower()), "")
+                    except Exception:
+                        dmarc_txt = ""
+                    try:
+                        spf_txt = next((t for t in (await self.lookup.resolve_txt_join(registered)) if "v=spf1" in t.lower()), "")
+                    except Exception:
+                        spf_txt = ""
+                    try:
+                        bimi_txt = next((t for t in (await self.lookup.resolve_txt_join(f"default._bimi.{registered}")) if "v=bimi" in t.lower()), "")
+                    except Exception:
+                        bimi_txt = ""
+            except Exception:
+                spf_txt = dmarc_txt = bimi_txt = ""
+
+            # MTA-STS and TLS-RPT using existing helpers
+            try:
+                mta_info = await detect_mta_sts(registered, self.lookup, fetch_policy=self._fetch_mta_sts_policy)
+                has_mta_sts = bool(mta_info.get("has_mta_sts"))
+                mta_sts_txt = mta_info.get("raw_txt") or ""
+                mta_sts_mode = mta_info.get("mode") or ""
+                mta_sts_max_age = mta_info.get("max_age")
+                mta_sts_id = mta_info.get("id") or ""
+            except Exception:
+                has_mta_sts = False
+                mta_sts_txt = ""
+                mta_sts_mode = ""
+                mta_sts_max_age = None
+                mta_sts_id = ""
+
+            try:
+                tlsrpt_rua = await fetch_tlsrpt_rua(registered, self.lookup) or ""
+            except Exception:
+                tlsrpt_rua = ""

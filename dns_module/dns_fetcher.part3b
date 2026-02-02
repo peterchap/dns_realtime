@@ -1,0 +1,230 @@
+            # Optional blocking probes (HTTPS/SNTP cert) for under-customer MX
+            https_ok = https_days = https_issuer = https_san = None
+            smtp_ok = smtp_days = smtp_issuer = None
+            want_probes = self._run_blocking_probes and mx_host_final and (mx_under_customer or has_mta_sts)
+            if want_probes:
+                try:
+                    results = await asyncio.gather(
+                        probe_https_cert(registered, ips=mx_ips or None, probe_timeout=5.0),
+                        probe_smtp_starttls_cert(mx_host_final, ips=mx_ips or None, probe_timeout=5.0),
+                        return_exceptions=True,
+                    )
+                except Exception:
+                    results = []
+                if results:
+                    val = results[0] if len(results) > 0 else None
+                    if not isinstance(val, BaseException) and val:
+                        try:
+                            https_ok, https_days, https_issuer, https_san = val
+                        except Exception:
+                            https_ok = https_days = https_issuer = https_san = None
+                    val = results[1] if len(results) > 1 else None
+                    if not isinstance(val, BaseException) and val:
+                        try:
+                            smtp_ok, smtp_days, smtp_issuer = val
+                        except Exception:
+                            smtp_ok = smtp_days = smtp_issuer = None
+
+            # Hosts (www/mail) from expanded host cache; fallback to resolve_a_aaaa
+            www_host = f"www.{registered}" if registered else ""
+            www_a_first = ""
+            www_ptr = ""
+            www_cname = ""
+            www_info = hosts.get(www_host, {}) if hosts else {}
+            if www_info:
+                www_a_list = www_info.get("a", []) or []
+                www_a_first = www_a_list[0] if www_a_list else ""
+                # ptr available from ptrs mapping
+                if www_a_first:
+                    www_ptr = ptrs.get(www_a_first) if ptrs and www_a_first in ptrs else await self.lookup.resolve_ptr_once(www_a_first)
+                www_cname = www_info.get("cname") or ""
+            else:
+                try:
+                    www_a_list, _, _, _ = await self.lookup.resolve_a_aaaa(www_host)
+                    www_a_first = www_a_list[0] if www_a_list else ""
+                except Exception:
+                    www_a_first = ""
+                if www_a_first:
+                    try:
+                        www_ptr = await self.lookup.resolve_ptr_first(www_a_first)
+                    except Exception:
+                        www_ptr = ""
+                # try CNAME
+                try:
+                    resp = await self.lookup._retry_resolve(www_host, "CNAME")
+                    if resp and resp[0]:
+                        rr = next(iter(resp[0]), None)
+                        if rr:
+                            www_cname = str(getattr(rr, "cname", getattr(rr, "target", getattr(rr, "name", rr)))).rstrip(".").lower()
+                except Exception:
+                    www_cname = ""
+
+            # mail host
+            mail_host = f"mail.{registered}" if registered else ""
+            mail_a_first = ""
+            mail_ptr = ""
+            mail_cname = ""
+            mail_info = hosts.get(mail_host, {}) if hosts else {}
+            if mail_info:
+                mail_a_list = mail_info.get("a", []) or []
+                mail_a_first = mail_a_list[0] if mail_a_list else ""
+                if mail_a_first:
+                    mail_ptr = ptrs.get(mail_a_first) if ptrs and mail_a_first in ptrs else await self.lookup.resolve_ptr_once(mail_a_first)
+                mail_cname = mail_info.get("cname") or ""
+            else:
+                try:
+                    mail_a_list, _, _, _ = await self.lookup.resolve_a_aaaa(mail_host, want_ipv6=True)
+                    mail_a_first = mail_a_list[0] if mail_a_list else ""
+                except Exception:
+                    mail_a_first = ""
+                if mail_a_first:
+                    try:
+                        mail_ptr = await self.lookup.resolve_ptr_first(mail_a_first)
+                    except Exception:
+                        mail_ptr = ""
+                try:
+                    resp_mail_cname = await self.lookup._retry_resolve(mail_host, "CNAME")
+                    if resp_mail_cname and resp_mail_cname[0]:
+                        rr = next(iter(resp_mail_cname[0]), None)
+                        if rr:
+                            mail_cname = str(getattr(rr, "cname", getattr(rr, "target", getattr(rr, "name", rr)))).rstrip(".").lower()
+                except Exception:
+                    mail_cname = ""
+
+            # Derived/aggregate values
+            https_san_count = len(https_san.split("|")) if (isinstance(https_san, str) and https_san) else 0
+            ip_int = ip_to_int(a_list[0]) if a_list else 0
+            a_ttl = expanded.get("ttl", 0) or 0
+            ns1_list = ns_list if isinstance(ns_list, list) else ([ns_list] if ns_list else [])
+            ns1_str = list_to_string(ns1_list) if ns1_list else ""
+            a_str = list_to_string(a_list) if a_list else ""
+            aaaa_str = list_to_string(aaaa_list) if aaaa_list else ""
+
+            # CAA / NAPTR / SRV (flatten and normalize)
+            try:
+                raw_caa = expanded.get("caa") or expanded.get("CAA") or []
+            except Exception:
+                raw_caa = []
+            try:
+                raw_naptr = expanded.get("naptr") or expanded.get("NAPTR") or []
+            except Exception:
+                raw_naptr = []
+            # SRV can be a dict of service -> list or a flat list
+            try:
+                raw_srv = expanded.get("srv") or expanded.get("SRV") or []
+            except Exception:
+                raw_srv = []
+
+            # Normalize to lists of strings
+            caa_list = []
+            try:
+                if isinstance(raw_caa, list):
+                    caa_list = [str(x) for x in raw_caa]
+                elif raw_caa:
+                    caa_list = [str(raw_caa)]
+            except Exception:
+                caa_list = raw_caa if isinstance(raw_caa, list) else ([raw_caa] if raw_caa else [])
+
+            naptr_list = []
+            try:
+                if isinstance(raw_naptr, list):
+                    naptr_list = [str(x) for x in raw_naptr]
+                elif raw_naptr:
+                    naptr_list = [str(raw_naptr)]
+            except Exception:
+                naptr_list = raw_naptr if isinstance(raw_naptr, list) else ([raw_naptr] if raw_naptr else [])
+
+            srv_list = []
+            try:
+                if isinstance(raw_srv, dict):
+                    flat_srv = []
+                    for v in raw_srv.values():
+                        if isinstance(v, list):
+                            flat_srv.extend(v)
+                        elif v:
+                            flat_srv.append(v)
+                    srv_list = [str(x) for x in flat_srv]
+                elif isinstance(raw_srv, list):
+                    srv_list = [str(x) for x in raw_srv]
+                elif raw_srv:
+                    srv_list = [str(raw_srv)]
+            except Exception:
+                srv_list = []
+
+            # Build structured forms for downstream consumers
+            caa_struct = []
+            try:
+                for item in (raw_caa if isinstance(raw_caa, list) else ([] if not raw_caa else [raw_caa])):
+                    if isinstance(item, dict):
+                        caa_struct.append({
+                            "flags": item.get("flags"),
+                            "tag": item.get("tag"),
+                            "value": item.get("value"),
+                        })
+                    else:
+                        caa_struct.append({"raw": str(item)})
+            except Exception:
+                caa_struct = [{"raw": s} for s in caa_list]
+
+            naptr_struct = []
+            try:
+                for item in (raw_naptr if isinstance(raw_naptr, list) else ([] if not raw_naptr else [raw_naptr])):
+                    if isinstance(item, dict):
+                        naptr_struct.append({
+                            "order": item.get("order"),
+                            "preference": item.get("preference"),
+                            "flags": item.get("flags"),
+                            "services": item.get("services"),
+                            "regexp": item.get("regexp"),
+                            "replacement": item.get("replacement"),
+                        })
+                    else:
+                        naptr_struct.append({"raw": str(item)})
+            except Exception:
+                naptr_struct = [{"raw": s} for s in naptr_list]
+
+            srv_struct = []
+            try:
+                # Flatten raw_srv for struct building
+                items = []
+                # Track service/proto when available
+                svc_pairs: List[Tuple[str, str]] = []
+                if isinstance(raw_srv, dict):
+                    for k, v in raw_srv.items():
+                        # k like "_xmpp._tcp" or "_sip._tcp"
+                        try:
+                            svc, proto = (k.split(".")[0], k.split(".")[1]) if "." in k else (k, "")
+                        except Exception:
+                            svc, proto = (k, "")
+                        count_before = len(items)
+                        if isinstance(v, list):
+                            items.extend(v)
+                        elif v:
+                            items.append(v)
+                        # Add matching service/proto for appended items
+                        added = len(items) - count_before
+                        svc_pairs.extend([(svc, proto)] * max(added, 0))
+                elif isinstance(raw_srv, list):
+                    items = raw_srv
+                elif raw_srv:
+                    items = [raw_srv]
+                for idx, item in enumerate(items):
+                    if isinstance(item, dict):
+                        srv_struct.append({
+                            "priority": item.get("priority"),
+                            "weight": item.get("weight"),
+                            "port": item.get("port"),
+                            "target": item.get("target"),
+                            "service": (svc_pairs[idx][0] if idx < len(svc_pairs) else None),
+                            "proto": (svc_pairs[idx][1] if idx < len(svc_pairs) else None),
+                            "ttl": None,
+                        })
+                    else:
+                        srv_struct.append({
+                            "raw": str(item),
+                            "service": (svc_pairs[idx][0] if idx < len(svc_pairs) else None),
+                            "proto": (svc_pairs[idx][1] if idx < len(svc_pairs) else None),
+                            "ttl": None,
+                        })
+            except Exception:
+                srv_struct = [{"raw": s, "service": None, "proto": None, "ttl": None} for s in srv_list]

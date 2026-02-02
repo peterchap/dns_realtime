@@ -1,0 +1,308 @@
+            mail_mx_banner_details=mx_banner_details or "",
+            mail_mx_banner_provider=mx_banner_provider or "",
+            mail_mx_banner_category=mx_banner_category or "",
+            smtp_cert_ok=smtp_ok,
+            smtp_cert_days_left=smtp_days,
+            smtp_cert_issuer=smtp_issuer or "",
+            https_cert_ok=https_ok,
+            https_cert_days_left=https_days,
+            https_cert_issuer=https_issuer or "",
+            https_cert_san_count=(len(https_san.split("|")) if (isinstance(https_san, str) and https_san) else 0),
+            has_mta_sts=bool(has_mta_sts),
+            mta_sts_txt=mta_sts_txt or "",
+            mta_sts_mode=mta_sts_mode or "",
+            mta_sts_max_age=mta_sts_max_age,
+            mta_sts_id=mta_sts_id or "",
+            tlsrpt_rua=tlsrpt_rua or "",
+            dnssec=bool(dnssec),
+            soa_serial=soa_serial or 0,
+            refresh_date=now,
+        )
+
+        try:
+            for f in getattr(rec, "__dataclass_fields__", {}).values():
+                if f.type in (str, Optional[str]):
+                    v = getattr(rec, f.name)
+                    if isinstance(v, str) and v == "":
+                        setattr(rec, f.name, None)
+        except Exception:
+            pass
+
+        return rec
+
+    async def _gather_mx_data_compat(self, host_input: Optional[str], registered: str):
+        """
+        Compatibility helper to replicate the original _gather_mx_data behaviour when falling back to legacy path.
+        We extracted this so legacy flow can call it without duplicating code.
+        """
+        # This function mirrors the original logic you had inside DNSFetcher._gather_mx_data
+        # For brevity keep the implementation concise but functionally equivalent.
+        mx_host_final = ""
+        mx_regdom_final = ""
+        mx_cname_chain: List[str] = []
+        mx_under_customer = False
+        mx_ips: List[str] = []
+        mx_ptr_first = ""
+        mx_ptr_regdom_first = ""
+        mx_banner_raw = mx_banner_host = mx_banner_details = None
+        mx_banner_provider = mx_banner_category = None
+        mx_domain = ""
+        mx_tld = ""
+        spf_txt = ""
+        dmarc_txt = ""
+        bimi_txt = ""
+        status = "NOERROR"
+        mta_sts_txt = ""
+        mta_sts_mode = ""
+        mta_sts_max_age = None
+        mta_sts_id = ""
+        has_mta_sts = False
+        tlsrpt_rua = ""
+        https_ok = https_days = https_issuer = https_san = None
+        smtp_ok = smtp_days = smtp_issuer = None
+
+        if host_input:
+            try:
+                mx_host_final, chain = await self.lookup.cname_chain(host_input, limit=5)
+                mx_cname_chain = chain or []
+                mx_host_final = mx_host_final or host_input
+            except Exception:
+                mx_host_final = host_input
+                mx_cname_chain = []
+
+            try:
+                mx_a, mx_aaaa, _, _ = await self.lookup.resolve_a_aaaa(mx_host_final)
+            except Exception:
+                mx_a, mx_aaaa = [], []
+            mx_ips = (mx_a or []) + (mx_aaaa or [])
+
+            if mx_ips:
+                try:
+                    mx_ptr_first = await self.lookup.resolve_ptr_first(mx_ips[0])
+                except Exception:
+                    mx_ptr_first = ""
+                mx_ptr_regdom_first = reg_domain(mx_ptr_first) if mx_ptr_first else ""
+
+            mx_regdom_final = reg_domain(mx_host_final) if mx_host_final else ""
+            mx_under_customer = bool(mx_regdom_final and mx_regdom_final == registered)
+
+            if mx_host_final:
+                mx_domain = reg_domain(mx_host_final) or ""
+                if mx_domain:
+                    parts = mx_domain.split(".")
+                    mx_tld = parts[-1] if parts else ""
+
+            # Optional SMTP banner for under-customer MX
+            if mx_host_final and mx_under_customer and self.smtp_banner_client:
+                try:
+                    banner = await asyncio.wait_for(self.smtp_banner_client(mx_host_final, 25), timeout=2.0)
+                    if banner:
+                        mx_banner_raw = banner
+                        try:
+                            bh, bd = parse_smtp_banner(banner) or (None, None)
+                        except Exception:
+                            bh, bd = None, None
+                        mx_banner_host = bh
+                        mx_banner_details = bd
+                        try:
+                            prov, cat = infer_mbp_from_banner(bh or "", bd or "")
+                        except Exception:
+                            prov, cat = None, None
+                        mx_banner_provider = prov
+                        mx_banner_category = cat
+                except Exception:
+                    mx_banner_raw = mx_banner_host = mx_banner_details = None
+                    mx_banner_provider = mx_banner_category = None
+
+            # Safe TXT lookups (self.lookup may be None or lack resolve_txt_join)
+            try:
+                if self.lookup and hasattr(self.lookup, "resolve_txt_join"):
+                    dmarc_candidates = await self.lookup.resolve_txt_join(f"_dmarc.{registered}")
+                    dmarc_txt = next((t for t in dmarc_candidates if isinstance(t, str) and "v=dmarc" in t.lower()), "")
+                else:
+                    dmarc_txt = ""
+            except Exception:
+                dmarc_txt = ""
+            try:
+                if self.lookup and hasattr(self.lookup, "resolve_txt_join"):
+                    spf_candidates = await self.lookup.resolve_txt_join(registered)
+                    spf_txt = next((t for t in spf_candidates if isinstance(t, str) and "v=spf1" in t.lower()), "")
+                else:
+                    spf_txt = ""
+            except Exception:
+                spf_txt = ""
+            try:
+                if self.lookup and hasattr(self.lookup, "resolve_txt_join"):
+                    bimi_candidates = await self.lookup.resolve_txt_join(f"default._bimi.{registered}")
+                    bimi_txt = next((t for t in bimi_candidates if isinstance(t, str) and "v=bimi" in t.lower()), "")
+                else:
+                    bimi_txt = ""
+            except Exception:
+                bimi_txt = ""
+            try:
+                mta_info = await detect_mta_sts(registered, self.lookup, fetch_policy=self._fetch_mta_sts_policy)
+                has_mta_sts = bool(mta_info.get("has_mta_sts"))
+                mta_sts_txt = mta_info.get("raw_txt") or ""
+                mta_sts_mode = mta_info.get("mode") or ""
+                mta_sts_max_age = mta_info.get("max_age")
+                mta_sts_id = mta_info.get("id") or ""
+            except Exception:
+                has_mta_sts = False
+                mta_sts_txt = ""
+                mta_sts_mode = ""
+                mta_sts_max_age = None
+                mta_sts_id = ""
+
+            try:
+                tlsrpt_rua = await fetch_tlsrpt_rua(registered, self.lookup) or ""
+            except Exception:
+                tlsrpt_rua = ""
+
+            # Optional blocking probes
+            want_probes = self._run_blocking_probes and mx_host_final and (mx_under_customer or has_mta_sts)
+            if want_probes:
+                try:
+                    results = await asyncio.gather(
+                        probe_https_cert(registered, ips=mx_ips or None, probe_timeout=5.0),
+                        probe_smtp_starttls_cert(mx_host_final, ips=mx_ips or None, probe_timeout=5.0),
+                        return_exceptions=True,
+                    )
+                except Exception:
+                    results = []
+
+                if results:
+                    val = results[0] if len(results) > 0 else None
+                    if not isinstance(val, BaseException) and val:
+                        try:
+                            https_ok, https_days, https_issuer, https_san = val
+                        except Exception:
+                            https_ok = https_days = https_issuer = https_san = None
+                    val = results[1] if len(results) > 1 else None
+                    if not isinstance(val, BaseException) and val:
+                        try:
+                            smtp_ok, smtp_days, smtp_issuer = val
+                        except Exception:
+                            smtp_ok = smtp_days = smtp_issuer = None
+
+        return (
+            mx_host_final,
+            mx_regdom_final,
+            mx_cname_chain,
+            mx_under_customer,
+            mx_ips,
+            mx_ptr_first,
+            mx_ptr_regdom_first,
+            mx_banner_raw,
+            mx_banner_host,
+            mx_banner_details,
+            mx_banner_provider,
+            mx_banner_category,
+            mx_domain,
+            mx_tld,
+            spf_txt,
+            dmarc_txt,
+            bimi_txt,
+            status,
+            mta_sts_txt,
+            mta_sts_mode,
+            mta_sts_max_age,
+            mta_sts_id,
+            has_mta_sts,
+            tlsrpt_rua,
+            https_ok,
+            https_days,
+            https_issuer,
+            https_san,
+            smtp_ok,
+            smtp_days,
+            smtp_issuer,
+
+        )
+
+
+async def fetch_batch(
+    domains: Iterable[str],
+    semaphore: Optional[asyncio.Semaphore] = None,
+    workers: int = DEFAULT_BATCH_WORKERS,
+    retry_limit: int = 1,
+    logger_obj: Optional[Any] = None,
+) -> Tuple[List[DNSRecord], List[DNSRecord]]:
+    """
+    Batch-mode DNS fetcher. Returns (results, retries).
+    """
+
+    # Prefer an injected logger (e.g. app logger bound in DNSApplication), otherwise use module log
+    local_log = logger_obj if logger_obj is not None else log
+    # If injected logger is loguru-like, bind additional context
+    try:
+        if hasattr(local_log, "bind"):
+            local_log = local_log.bind(workers=workers)
+    except Exception:
+        pass
+
+    local_log.info("Starting fetch_batch: workers={} retry_limit={}", workers, retry_limit)
+
+    # Ensure fetch_domain exists
+    try:
+        fetch_domain  # type: ignore[name-defined]
+    except NameError:
+        raise RuntimeError("fetch_domain not defined in dns_fetcher module")
+
+    if semaphore is None:
+        semaphore = dns_lookup.default_semaphore()
+
+    # Create queue and enqueue domains
+    queue: asyncio.Queue = asyncio.Queue()
+    count = 0
+    for d in domains:
+        await queue.put(d)
+        count += 1
+    local_log.info("Enqueued {} domains for batch fetch", count)
+
+    results: List[DNSRecord] = []
+    retries: List[DNSRecord] = []
+
+    async def _worker(worker_id: int):
+        local_log.debug("Worker {} started", worker_id)
+        while True:
+            item = await queue.get()
+            if item is None:
+                queue.task_done()
+                local_log.debug("Worker {} received sentinel and will exit", worker_id)
+                break
+            domain = item
+            try:
+                rec = await fetch_domain(domain, semaphore=semaphore, retry_limit=retry_limit)
+                if getattr(rec, "status", None) == "needs_retry":
+                    retries.append(rec)
+                    local_log.debug("Domain {} marked needs_retry", domain)
+                else:
+                    results.append(rec)
+                    local_log.debug("Domain {} fetched OK", domain)
+            except Exception as e:
+                # Log exception with traceback
+                try:
+                    local_log.exception("fetch_domain failed for {} (worker {})", domain, worker_id)
+                except Exception:
+                    # fallback minimal log
+                    local_log.exception("fetch_domain failed for {} (worker {})", domain, worker_id)
+                fallback = DNSRecord(domain=domain, status="needs_retry", records={}, errors={"exception": str(e)}, meta={})
+                retries.append(fallback)
+            finally:
+                queue.task_done()
+
+    # Start workers
+    worker_tasks = [asyncio.create_task(_worker(i)) for i in range(workers)]
+
+    # Push sentinel for each worker
+    for _ in worker_tasks:
+        await queue.put(None)
+
+    # Wait until all tasks processed
+    await queue.join()
+
+    # Wait for workers to finish
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+    local_log.info("fetch_batch complete: results={} retries={}", len(results), len(retries))
+    return results, retries
