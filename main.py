@@ -165,5 +165,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        log.critical(f"Unhandled exception: {e}")
+        log.error(f"Unhandled exception: {e}")
         sys.exit(1)

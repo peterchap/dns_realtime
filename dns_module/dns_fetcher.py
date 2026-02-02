@@ -803,11 +803,26 @@ class DNSFetcher:
                 fetch_result = fetch_domain(domain_ascii)
                 if inspect.isawaitable(fetch_result):
                     # Allow a slightly higher ceiling than per-record timeout
-                    expanded = await asyncio.wait_for(fetch_result, timeout=self._domain_timeout_s)
+                    raw_obj = await asyncio.wait_for(fetch_result, timeout=self._domain_timeout_s)
                 else:
                     # Run synchronous implementation in thread
-                    raw_result = await asyncio.wait_for(asyncio.to_thread(fetch_domain, domain_ascii), timeout=self._domain_timeout_s)
-                    expanded = cast(Dict[str, Any], raw_result) if isinstance(raw_result, dict) else None
+                    raw_obj = await asyncio.wait_for(asyncio.to_thread(fetch_domain, domain_ascii), timeout=self._domain_timeout_s)
+                
+                # Convert DNSRecord object to dict compatible with legacy logic
+                if raw_obj and hasattr(raw_obj, "records"):
+                    expanded = {}
+                    # 1. Flatten records
+                    expanded.update(raw_obj.records)
+                    # 2. Add status
+                    expanded["status"] = raw_obj.status
+                    # 3. Flatten errors (legacy expects 'ns_error', 'a_error', etc.)
+                    for k, v in raw_obj.errors.items():
+                        expanded[f"{k.lower()}_error"] = v
+                    # 4. Flatten meta
+                    expanded.update(raw_obj.meta)
+                else:
+                    expanded = cast(Dict[str, Any], raw_obj) if isinstance(raw_obj, dict) else None
+
             except asyncio.TimeoutError:
                 self.log(f"[{self.domain}] fetch_domain timeout after {self._domain_timeout_s}s")
             except Exception as e:
