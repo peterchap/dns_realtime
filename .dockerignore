@@ -1,0 +1,23 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Logs
+*.log
+build_debug.log
+
+# Artifacts
+task.md
+walkthrough.md
+implementation_plan.md
+.gemini/
