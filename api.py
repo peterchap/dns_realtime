@@ -93,7 +93,7 @@ def health_check():
 
 @app.get("/lookup", dependencies=[Depends(check_api_key)])
 @limiter.limit(lambda: os.getenv("RATE_LIMIT", "60/minute"))
-async def lookup_domain(request: Request, domain: str, timeout: float = 5.0):
+async def lookup_domain(request: Request, domain: str, timeout: float = 10.0):
     if not scorer:
         raise HTTPException(status_code=503, detail="Risk scorer not initialized")
         
