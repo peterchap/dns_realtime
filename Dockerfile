@@ -21,5 +21,8 @@ ENV PYTHONUNBUFFERED=1
 # Expose port (Cloud Run defaults to 8080)
 EXPOSE 8080
 
+# Set default DNS servers to Google/Cloudflare (since we don't have local Unbound)
+ENV DNS_NAMESERVERS="8.8.8.8,1.1.1.1"
+
 # Command to run the application using uvicorn
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips", "*"]
