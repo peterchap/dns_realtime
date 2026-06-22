@@ -1254,7 +1254,7 @@ class DNSFetcher:
                         a_list = a_retry
                         aaaa_list = aaaa_retry or aaaa_list
                         a_err = ""
-                        expanded["ttl"] = ttl_retry or expanded.get("ttl", 0)
+                        exp_map["ttl"] = ttl_retry or exp_map.get("ttl", 0)
                 except Exception as e:
                     self.log(f"[{self.domain}] core retry failed: {e}")
 
@@ -1278,14 +1278,14 @@ class DNSFetcher:
                         a_list = a_retry
                         aaaa_list = aaaa_retry or aaaa_list
                         a_err = ""
-                        expanded["ttl"] = ttl_retry or expanded.get("ttl", 0)
+                        exp_map["ttl"] = ttl_retry or exp_map.get("ttl", 0)
                     status = "NOERROR" if self._core_noerror_exists(a_list, a_err, ns_list, ns_err, soa_mname, soa_err) else status
                 except Exception as e:
                     self.log(f"[{self.domain}] retry core probes failed: {e}")
                     return None
 
             # Determine MX info
-            mx_list = expanded.get("mx") or []
+            mx_list = exp_map.get("mx") or []
             mx_host_input = ""
             mx_pref = 0
             if isinstance(mx_list, list) and mx_list:
@@ -1336,7 +1336,7 @@ class DNSFetcher:
             bimi_txt = ""
             try:
                 # expand may have txt entries for apex; if not, fall back to lookup helpers
-                txts = expanded.get("txt") or []
+                txts = exp_map.get("txt") or []
                 if txts:
                     # normalize bytes/objects to strings
                     txt_norm = []
@@ -1482,7 +1482,7 @@ class DNSFetcher:
             # Derived/aggregate values
             https_san_count = len(https_san.split("|")) if (isinstance(https_san, str) and https_san) else 0
             ip_int = ip_to_int(a_list[0]) if a_list else 0
-            a_ttl = expanded.get("ttl", 0) or 0
+            a_ttl = exp_map.get("ttl", 0) or 0
             ns1_list = ns_list if isinstance(ns_list, list) else ([ns_list] if ns_list else [])
             ns1_str = list_to_string(ns1_list) if ns1_list else ""
             a_str = list_to_string(a_list) if a_list else ""
@@ -1490,16 +1490,16 @@ class DNSFetcher:
 
             # CAA / NAPTR / SRV (flatten and normalize)
             try:
-                raw_caa = expanded.get("caa") or expanded.get("CAA") or []
+                raw_caa = exp_map.get("caa") or exp_map.get("CAA") or []
             except Exception:
                 raw_caa = []
             try:
-                raw_naptr = expanded.get("naptr") or expanded.get("NAPTR") or []
+                raw_naptr = exp_map.get("naptr") or exp_map.get("NAPTR") or []
             except Exception:
                 raw_naptr = []
             # SRV can be a dict of service -> list or a flat list
             try:
-                raw_srv = expanded.get("srv") or expanded.get("SRV") or []
+                raw_srv = exp_map.get("srv") or exp_map.get("SRV") or []
             except Exception:
                 raw_srv = []
 
@@ -1632,7 +1632,7 @@ class DNSFetcher:
                 ip_int=ip_int,
                 a_ttl=a_ttl,
                 ptr=ptrs.get(a_list[0], "") if a_list and ptrs else (ptrs.get(a_list[0], "") if ptrs else ""),
-                cname=expanded.get("cname", "") or "",
+                cname=exp_map.get("cname", "") or "",
                 mx=mx_host_input or "",
                 mx_priority=mx_pref or 0,
                 mx_host_final=mx_host_final or "",
