@@ -22,6 +22,8 @@ class DNSRecords:
     a_ttl: Optional[int]
     ptr: str
     cname: str
+    ns_ips: List[str]
+    ns_ip_int: Optional[int]
 
     # --- MX records ---
     mx: str
@@ -105,6 +107,7 @@ class DNSRecords:
     naptr: str = ""
     srv: str = ""
     # Structured lists capturing detailed record values
+    soa_records: List[Dict[str, Any]] = field(default_factory=list)
     caa_records: List[Dict[str, Any]] = field(default_factory=list)
     naptr_records: List[Dict[str, Any]] = field(default_factory=list)
     srv_records: List[Dict[str, Any]] = field(default_factory=list)

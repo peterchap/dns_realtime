@@ -1,0 +1,178 @@
+# smtp_banner.py
+from __future__ import annotations
+import re
+from typing import Optional, Tuple, Dict, Any, List, cast
+
+import pyarrow as pa
+import polars as pl
+
+BANNER_VERSION = "2025.10.21-rc1"
+
+# Robust "220 ..." banner parse:
+ROBUST_BANNER_REGEX = re.compile(
+    r"^\s*220\s+([^\s]+)(?:\s+(?:E?SMTP)\s*(.*))?$",
+    re.IGNORECASE
+)
+
+def parse_smtp_banner(banner: str) -> Optional[Tuple[str, str]]:
+    """
+    Returns (announced_hostname, software_details) or None.
+    Examples
+      "220 mail.foo.com ESMTP Postfix"           -> ("mail.foo.com", "Postfix")
+      "220 mx.google.com ESMTP gv21... - gsmtp"  -> ("mx.google.com", "gv21... - gsmtp")
+      "220-out.example.com ESMTP"                -> ("220-out.example.com", "")
+    """
+    if not banner:
+        return None
+    m = ROBUST_BANNER_REGEX.match(banner.strip())
+    if not m:
+        return None
+    host, details = m.groups()
+    return (host.strip().lower(), (details or "").strip())
+
+# --- Provider fingerprint catalogue (extendable) ---
+
+# Order matters: first match wins.
+PROVIDER_RULES: List[Dict[str, Any]] = [
+    # Enterprise suites
+    {"name":"Google Workspace", "category":"enterprise", "confidence":95,
+     "host":r"(?:^|\.)google\.com$", "details":r"\bgsmtp\b"},
+    {"name":"Microsoft 365 (EOP)", "category":"enterprise", "confidence":95,
+     "host":r"(?:mail\.|.*\.)protection\.outlook\.com$", "details":r""},
+    {"name":"Microsoft 365 (Outlook)", "category":"enterprise", "confidence":85,
+     "host":r"(?:^|\.)outlook\.com$", "details":r""},
+
+    # SEG (Secure Email Gateway)
+    {"name":"Proofpoint", "category":"seg", "confidence":95,
+     "host":r"(?:^|\.)pphosted\.com$", "details":r"\bproofpoint\b"},
+    {"name":"Mimecast", "category":"seg", "confidence":95,
+     "host":r"(?:^|\.)mimecast\.com$", "details":r"\bmimecast\b"},
+    {"name":"Cisco IronPort", "category":"seg", "confidence":90,
+     "host":r"(?:^|\.)secureserver\.net$|(?:^|\.)iphmx\.com$", "details":r"\b(ironport|cisco)\b"},
+    {"name":"Barracuda", "category":"seg", "confidence":90,
+     "host":r"(?:^|\.)barracudanetworks\.com$", "details":r"\bbarracuda\b"},
+
+    # ESP / transactionals
+    {"name":"SendGrid", "category":"esp", "confidence":85,
+     "host":r"(?:^|\.)sendgrid\.net$", "details":r"\bsendgrid\b"},
+    {"name":"Mailgun", "category":"esp", "confidence":85,
+     "host":r"(?:^|\.)mailgun\.net$", "details":r"\b(mailgun|mxmg)\b"},
+    {"name":"Amazon SES", "category":"esp", "confidence":80,
+     "host":r"(?:^|\.)amazonses\.com$", "details":r"(?:Amazon SES|ESMTPSA)?"},
+    {"name":"SparkPost", "category":"esp", "confidence":80,
+     "host":r"(?:^|\.)sparkpostmail\.com$", "details":r"\bsparkpost\b"},
+
+    # Other enterprise mail
+    {"name":"Zoho Mail", "category":"enterprise", "confidence":85,
+     "host":r"(?:^|\.)zoho\.com$", "details":r"\bzoho\b"},
+
+    # OSS MTAs (often self-hosted)
+    {"name":"Postfix", "category":"self_hosted", "confidence":70,
+     "host":r".*", "details":r"\bpostfix\b"},
+    {"name":"Exim", "category":"self_hosted", "confidence":70,
+     "host":r".*", "details":r"\bexim\b"},
+    {"name":"Haraka", "category":"self_hosted", "confidence":70,
+     "host":r".*", "details":r"\bharaka\b"},
+    {"name":"OpenSMTPD", "category":"self_hosted", "confidence":70,
+     "host":r".*", "details":r"\bOpenSMTPD\b"},
+]
+
+def _fingerprint_provider(host: str, details: str) -> Tuple[str, str, int]:
+    h = (host or "").lower()
+    d = (details or "").lower()
+    for rule in PROVIDER_RULES:
+        host_ok = re.search(rule["host"], h) is not None if rule.get("host") else True
+        detl_ok = re.search(rule["details"], d) is not None if rule.get("details") else True
+        if host_ok and detl_ok:
+            return rule["name"], rule["category"], int(rule["confidence"])
+    return "Unknown", "unknown", 0
+
+def _same_registered_domain(mx_host: str, registered_domain: str) -> bool:
+    """
+    True if MX host ends with the same registered domain suffix (e.g., mail.xyz.com vs xyz.com).
+    Assumes registered_domain is PSL-normalized upstream.
+    """
+    if not mx_host or not registered_domain:
+        return False
+    mxh = mx_host.strip().lower().rstrip(".")
+    rd  = registered_domain.strip().lower().rstrip(".")
+    return mxh == rd or mxh.endswith("." + rd)
+
+def add_banner_features_arrow(table: pa.Table) -> pa.Table:
+    """
+    Consume an Arrow table with columns:
+      - registered_domain (fallback to domain if missing)
+      - mx_host_norm (or mail_mx / mx)
+      - mx_banner_raw (raw banner string from SMTP 220 line)
+    Produce:
+      - mx_banner_host, mx_banner_details
+      - mx_banner_provider, mx_banner_category, mx_banner_confidence, mx_banner_inferred
+      - mx_self_hosted_candidate (bool)
+      - banner_features_version
+    """
+    df: pl.DataFrame = cast(pl.DataFrame, pl.from_arrow(table))
+
+    # Ensure base columns
+    if "registered_domain" not in df.columns:
+        if "domain" in df.columns:
+            df = df.with_columns(pl.col("domain").str.to_lowercase().alias("registered_domain"))
+        else:
+            df = df.with_columns(pl.lit("").alias("registered_domain"))
+
+    # Normalize mx host source
+    if "mx_host_norm" in df.columns:
+        mx_source = pl.col("mx_host_norm")
+    elif "mail_mx" in df.columns:
+        mx_source = pl.col("mail_mx").str.to_lowercase()
+    elif "mx" in df.columns:
+        mx_source = pl.col("mx").str.to_lowercase()
+    else:
+        mx_source = pl.lit("")
+
+    df = df.with_columns(mx_source.alias("__mx_host_src"))
+
+    # Parse banners
+    def _parse_host(banner: str) -> str:
+        p = parse_smtp_banner(banner)
+        return p[0] if p else ""
+
+    def _parse_details(banner: str) -> str:
+        p = parse_smtp_banner(banner)
+        return p[1] if p else ""
+
+    df = df.with_columns([
+        pl.col("mx_banner_raw").map_elements(_parse_host, return_dtype=pl.Utf8).alias("mx_banner_host"),
+        pl.col("mx_banner_raw").map_elements(_parse_details, return_dtype=pl.Utf8).alias("mx_banner_details"),
+    ]) if "mx_banner_raw" in df.columns else df.with_columns([
+        pl.lit("").alias("mx_banner_host"),
+        pl.lit("").alias("mx_banner_details"),
+    ])
+
+    # Provider fingerprint from banner host/details
+    def _fp_host_details(rec: dict) -> dict:
+        provider, cat, conf = _fingerprint_provider(rec.get("mx_banner_host",""), rec.get("mx_banner_details",""))
+        return {"provider": provider, "category": cat, "confidence": conf}
+
+    df = df.with_columns(
+        pl.struct(["mx_banner_host", "mx_banner_details"]).map_elements(
+            _fp_host_details, return_dtype=pl.Struct({"provider": pl.Utf8, "category": pl.Utf8, "confidence": pl.Int64})
+        ).alias("__fp")
+    ).with_columns([
+        pl.col("__fp").struct.field("provider").alias("mx_banner_provider"),
+        pl.col("__fp").struct.field("category").alias("mx_banner_category"),
+        pl.col("__fp").struct.field("confidence").alias("mx_banner_confidence"),
+        (pl.col("mx_banner_provider") != "Unknown").alias("mx_banner_inferred"),
+    ]).drop(["__fp"])
+
+    # Self-hosted candidate (MX vanity under same regdom)
+    df = df.with_columns(
+        pl.struct(["__mx_host_src", "registered_domain"]).map_elements(
+            lambda s: _same_registered_domain(s["__mx_host_src"], s["registered_domain"]),
+            return_dtype=pl.Boolean
+        ).alias("mx_self_hosted_candidate")
+    ).drop(["__mx_host_src"])
+
+    # Stamp version
+    df = df.with_columns(pl.lit(BANNER_VERSION).alias("banner_features_version"))
+
+    return df.to_arrow()

@@ -168,7 +168,6 @@ async def probe_smtp_starttls_cert(
             except Exception:
                 pass
             try:
-                # read some server response/caps (best-effort)
                 _ = f.read(8192)
             except Exception:
                 pass

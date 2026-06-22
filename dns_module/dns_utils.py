@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import re
+import os
 import inspect
 from typing import Optional, List, Dict, Any, Iterable, Tuple, Set, cast
 
@@ -13,9 +14,26 @@ import tldextract
 # PSL extractor (shared, fast). If you manage PSL updates centrally,
 # set suffix_list_urls=None and pre-seed cache_dir.
 # --------------------------------------------------------------------
+# Determine cache directory: prefer env var, then NFS mount, then local fallback
+_CACHE_DIR = os.getenv("TLDEXTRACT_CACHE_DIR")
+if not _CACHE_DIR:
+    if os.name == 'nt':
+        # Windows: avoid /srv paths or potential network hangs, use local user directory
+        _CACHE_DIR = os.path.join(os.path.expanduser("~"), ".tldextract")
+    else:
+        _nfs_base = os.getenv("NFS_BASE", "/srv/nfs/shared")
+        _CACHE_DIR = os.path.join(_nfs_base, ".tldextract")
+
+# Ensure directory exists or use a writable temp location if not
+try:
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+except OSError:
+    # If NFS/shared path is not writable or valid, fallback to user home
+    _CACHE_DIR = os.path.join(os.path.expanduser("~"), ".tldextract")
+
 _EXTRACTOR = tldextract.TLDExtract(
-    cache_dir="/srv/nfs/shared/.tldextract",
-    suffix_list_urls=[],  # disable auto-download if you premanage PSL
+    cache_dir=_CACHE_DIR, include_psl_private_domains=True,
+    suffix_list_urls=[], 
 )
 
 # --------------------------------------------------------------------

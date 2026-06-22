@@ -1,0 +1,15 @@
+host_regex,details_regex,provider,category,confidence
+"(mx|smtp)\.google\.com|googlemail\.com",,Google,Mailbox Provider,95
+,outlook|office365|microsoft,Microsoft,Mailbox Provider,90
+,gsmtp,Google,Mailbox Provider,85
+,proofpoint,Proofpoint,Security Gateway,90
+,mimecast,Mimecast,Security Gateway,90
+,barracuda,Barracuda,Security Gateway,85
+,mailgun,Mailgun,Transactional,90
+,sendgrid,SendGrid,Transactional,90
+,amazonses,Amazon SES,Transactional,90
+,postfix,Postfix,Self-hosted MTA,80
+,exim,Exim,Self-hosted MTA,75
+,haraka,Haraka,Self-hosted MTA,70
+,qmail,Qmail,Self-hosted MTA,70
+
