@@ -1618,10 +1618,25 @@ class DNSFetcher:
                 srv_struct = [{"raw": s, "service": None, "proto": None, "ttl": None} for s in srv_list]
 
             # Compose record
+            # Determine soa_records safely (soa_struct or record may not be defined in this scope)
+            if 'soa_struct' in locals():
+                soa_records_var = locals().get('soa_struct') or []
+            elif 'record' in locals():
+                # Safely access record if it exists in locals()
+                _rec = locals().get('record')
+                try:
+                    soa_records_var = (_rec.meta.get('soa_struct') or []) if _rec is not None else []
+                except Exception:
+                    soa_records_var = []
+            else:
+                soa_records_var = []
+
             rec = DNSRecords(
                 domain=self.domain,
                 registered_domain=registered,
-                ns1=ns1_str,
+                    ns1=ns1_str,
+                    ns_ips=locals().get('ns_ips') or [],
+                    ns_ip_int=locals().get('ns_ip_int', 0),
                 soa=soa_mname or "",
                 status=status or "",
                 ns_error=ns_err or "",
@@ -1693,7 +1708,7 @@ class DNSFetcher:
                 caa_records=caa_struct,
                 naptr_records=naptr_struct,
                 srv_records=srv_struct,
-                soa_records=(record.meta.get('soa_struct') or []),
+                soa_records=soa_records_var,
                 aaaa_ttl=None,
                 mx_ttl=None,
                 txt_ttl=None,
