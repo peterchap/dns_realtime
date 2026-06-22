@@ -1202,6 +1202,11 @@ class DNSFetcher:
                 if "PTR" in recs and isinstance(recs.get("PTR"), dict):
                     ptrs_map = recs.get("PTR") or {}
                 exp_map["ptrs"] = ptrs_map
+                # NS host IPs: prefer explicit ns_ips, else combine ns_host A/AAAA
+                exp_map["ns_ips"] = (
+                    recs.get("ns_ips")
+                    or (recs.get("ns_host_a") or []) + (recs.get("ns_host_aaaa") or [])
+                )
                 # No host cache is available from DNSRecord; keep empty to trigger fallbacks
                 exp_map["hosts"] = {}
             elif isinstance(expanded, dict):
@@ -1623,9 +1628,18 @@ class DNSFetcher:
                 srv_struct = [{"raw": s, "service": None, "proto": None, "ttl": None} for s in srv_list]
 
             # Compose record
+            # NS IPs and integer form of the first NS IP
+            ns_ips_val = exp_map.get("ns_ips") or []
+            if not isinstance(ns_ips_val, list):
+                ns_ips_val = [ns_ips_val] if ns_ips_val else []
+            ns_ips_val = [str(x) for x in ns_ips_val if x]
+            ns_ip_int_val = ip_to_int(ns_ips_val[0]) if ns_ips_val else 0
+
             rec = DNSRecords(
                 domain=self.domain,
                 registered_domain=registered,
+                ns_ips=ns_ips_val,
+                ns_ip_int=ns_ip_int_val,
                 ns1=ns1_str,
                 soa=soa_mname or "",
                 status=status or "",
