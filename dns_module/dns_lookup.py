@@ -263,6 +263,23 @@ def _env_list(name: str) -> Optional[List[str]]:
     except Exception:
         return None
 
+_DISABLE_CACHE: Optional[bool] = None
+
+
+def _cache_disabled() -> bool:
+    """Global kill-switch for ALL DNS caching (in-mem + LMDB), via DNS_DISABLE_CACHE.
+
+    Default OFF — batch processing keeps its cache untouched. The realtime
+    report/alert collector sets DNS_DISABLE_CACHE=1 in its own process so every
+    lookup is answered live (the LMDB negative cache otherwise returns a stale
+    empty MX even when the live record exists). Evaluated lazily on first use so
+    the flag need only be set before the first lookup, not before import."""
+    global _DISABLE_CACHE
+    if _DISABLE_CACHE is None:
+        _DISABLE_CACHE = os.getenv("DNS_DISABLE_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+    return _DISABLE_CACHE
+
+
 def _cache_enabled_for_type(rtype: str) -> bool:
     """Determine if LMDB caching is enabled for the given record type via env.
 
@@ -736,6 +753,8 @@ async def get_cached_result(
     and non-empty answers. When `include_expired` is False, respects TTL and
     returns None for expired entries.
     """
+    if _cache_disabled():
+        return None
     key = _cache_key(rtype, name)
     # Choose environment: 'ptr' uses secondary LMDB
     if (env_name or '').lower() == 'ptr':
@@ -767,13 +786,17 @@ async def perform_lookup(
     """
     key = _cache_key(rtype, name)
 
+    # Realtime collector: skip ALL caching, answer live (fresh MX/etc.).
+    cache_off = _cache_disabled()
+
     # Check in-memory cache first
-    cached = _get_from_inmem_cache(key)
-    if cached is not None:
-        return cached
+    if not cache_off:
+        cached = _get_from_inmem_cache(key)
+        if cached is not None:
+            return cached
 
     # Gate LMDB usage by type
-    persist_type = _cache_enabled_for_type(rtype) if use_lmdb else False
+    persist_type = _cache_enabled_for_type(rtype) if (use_lmdb and not cache_off) else False
 
     # Check LMDB cache
     if persist_type:
@@ -807,7 +830,8 @@ async def perform_lookup(
 
         # Cache result
         rcode, answers, ttl = result
-        _put_in_inmem_cache(key, rcode, answers, ttl)
+        if not cache_off:
+            _put_in_inmem_cache(key, rcode, answers, ttl)
 
         if persist_type:
             await _write_to_lmdb(key, rcode, answers, ttl)
