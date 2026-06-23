@@ -1173,6 +1173,27 @@ class DNSFetcher:
                 # a/aaaa
                 exp_map["a"] = recs.get("a") or recs.get("A") or []
                 exp_map["aaaa"] = recs.get("aaaa") or recs.get("AAAA") or []
+                # mx: fetch_domain stores MX as "pref:host" strings in records['mx'],
+                # but the norm below (mx_list -> mx_host_input) expects (pref, host)
+                # tuples. This copy was missing entirely, so MX silently dropped out
+                # of every expanded fetch (mx/mx_host_final/mx_regdom_final all empty)
+                # regardless of caching. Parse to tuples, sorted by preference so the
+                # primary MX is first.
+                mx_raw = recs.get("mx") or recs.get("MX") or []
+                if isinstance(mx_raw, str):
+                    mx_raw = [mx_raw]
+                mx_parsed: List[Tuple[int, str]] = []
+                for ans in mx_raw:
+                    s = str(ans).strip()
+                    if not s:
+                        continue
+                    pref, host = 0, s
+                    parts = s.split(":", 1)
+                    if len(parts) == 2 and parts[0].strip().isdigit():
+                        pref, host = int(parts[0].strip()), parts[1]
+                    mx_parsed.append((pref, host.rstrip(".")))
+                mx_parsed.sort(key=lambda t: t[0])
+                exp_map["mx"] = mx_parsed
                 # errors
                 exp_map["a_error"] = errs.get("A") or ""
                 exp_map["ns_error"] = errs.get("NS") or ""
